@@ -37,6 +37,11 @@ from .schemas import (
     ProposeItem,
     ProposeRequest,
     ProposeResponse,
+    ReleaseBatch,
+    ReleaseBatchGateRequest,
+    ReleaseBatchGateResponse,
+    ReleaseBatchReplicaItem,
+    ReleaseBatchZoneItem,
     RetainedDelta,
     RetentionPlanItem,
     RetentionPlanRequest,
@@ -72,8 +77,11 @@ from .serial import (
     plan_retention,
     plan_transfer,
     propose_serial,
+    ReleaseBatchValidationError,
     ReleaseOrderError,
+    evaluate_release_batch_gate,
     validate_mirror_reports,
+    validate_release_batch_input,
 )
 from .scenarios import generate_serial_scenarios
 
@@ -87,9 +95,11 @@ app = FastAPI(
         "评估每次发布在各故障域间的传播收敛时延（SLO），"
         "沿时间线检测各副本序列号无可共同推进候选的分裂窗口，"
         "对多镜像上报的 IXFR 增量按完整三元组做法定人数共识审计，"
-        "并可确定性生成覆盖回绕 / 正对点 / 分叉 / 环路边界的可复现场景样本。"
+        "并可确定性生成覆盖回绕 / 正对点 / 分叉 / 环路边界的可复现场景样本，"
+        "还能对多个 zone 的副本序列按 RFC 1982 判定共同可推进性，"
+        "在 zone 间前置依赖 DAG 上确定性分批发布并给出阻塞原因。"
     ),
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -772,6 +782,112 @@ def delta_consensus(request: DeltaConsensusRequest) -> DeltaConsensusResponse:
             )
             for item in outcome["mirrors"]
         ],
+    )
+
+
+@app.post("/release-batch-gate", response_model=ReleaseBatchGateResponse)
+def release_batch_gate(
+    request: ReleaseBatchGateRequest,
+) -> ReleaseBatchGateResponse:
+    """多 zone 分批发布门禁：按 RFC 1982 审计各 zone 副本序列并在依赖 DAG 上分批。
+
+    请求给出多个 zone，每个 zone 携带其副本当前序列号 ``replicas``、拟发布
+    目标 ``target`` 与前置依赖 ``requires``（本 zone 只能在全部前置发布之后
+    发布；同一 zone 的前置重复声明自动按重复项拒绝）。
+
+    整体校验失败返回 **422**（结构化错误体）：
+
+    * zone 名重复：``duplicate_zone``（含首次出现下标）；
+    * 前置引用了不存在的 zone：``unknown_dependency``；
+    * 自依赖：``self_dependency``；
+    * 同一 zone 的前置列表内部重复：``duplicate_dependency``；
+    * 前置依赖存在环：``dependency_cycle``（环规范化为从最小 zone 名起、
+      按依赖行进方向排列、首尾相接的 ``cycle``，并给出 ``cycle_edges``）；
+    * 某 zone 任一副本当前序列号与拟发布目标前向距离恰为 ``2^31``
+      （RFC 1982 正对点、不可比较）：``incomparable_serials``（含 zone、
+      副本下标与冲突值）。
+    * 单个 zone 内的副本名重复同样返回 422（``duplicate_replica_name``）。
+
+    校验通过后，先逐 zone 判定每个副本相对目标的关系与前向模距离：
+    ``older``（回退）副本为序列阻塞副本，``newer`` / ``equal`` 不阻塞；
+    ``max_forward_distance`` 取该 zone 全部副本前向距离的最大值。
+    再在依赖 DAG（zone -> 前置 zone）上分层：
+
+    * 第 1 批为无前置且自身可共同推进的 zone；第 k+1 批的全部前置都在
+      第 ≤ k 批、且至少一个前置恰在第 k 批（批次号即最长前置路径层数）；
+    * 自身存在回退副本的 zone 标记 ``blocked / older_serial``；自身可发布
+      但前置链上有未编入批次 zone 的标记
+      ``blocked / dependency_unsatisfied``，``blocked_by`` 给出未就位的
+      直接前置（升序）；
+    * ``batches`` 按批次号升序、批内 zone 名升序；``zones`` 保持请求顺序。
+      顶层 ``max_forward_distance`` 只统计已编入批次的 zone（无批次时为 0）。
+    跨 ``2^32`` 回绕的推进（如 ``4294967295 -> 0``）前向距离为 1，正常编入。
+    """
+    # 单个 zone 内的副本名重复
+    for zone in request.zones:
+        seen: set[str] = set()
+        for replica in zone.replicas:
+            if replica.name in seen:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "duplicate_replica_name",
+                        "zone": zone.zone,
+                        "name": replica.name,
+                    },
+                )
+            seen.add(replica.name)
+
+    zones = [
+        (
+            zone.zone,
+            [r.current for r in zone.replicas],
+            zone.target,
+            list(zone.requires),
+        )
+        for zone in request.zones
+    ]
+    try:
+        validate_release_batch_input(zones)
+    except ReleaseBatchValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.detail)
+
+    outcome = evaluate_release_batch_gate(zones)
+    replicas_by_zone = {zone.zone: zone.replicas for zone in request.zones}
+
+    return ReleaseBatchGateResponse(
+        scheduled=outcome["scheduled"],
+        batch_count=outcome["batch_count"],
+        max_forward_distance=outcome["max_forward_distance"],
+        batches=[
+            ReleaseBatch(batch=batch["batch"], zones=batch["zones"])
+            for batch in outcome["batches"]
+        ],
+        zones=[
+            ReleaseBatchZoneItem(
+                zone=item["zone"],
+                status=item["status"],
+                batch=item["batch"],
+                max_forward_distance=item["max_forward_distance"],
+                serial_ready=item["serial_ready"],
+                blocking_reason=item["blocking_reason"],
+                blocked_by=item["blocked_by"],
+                replicas=[
+                    ReleaseBatchReplicaItem(
+                        index=replica["index"],
+                        name=replicas_by_zone[item["zone"]][replica["index"]].name,
+                        current=replica["current"],
+                        target=replica["target"],
+                        relation=replica["relation"],
+                        forward_distance=replica["forward_distance"],
+                        blocking=replica["blocking"],
+                    )
+                    for replica in item["replicas"]
+                ],
+            )
+            for item in outcome["zones"]
+        ],
+        blocked_zones=outcome["blocked_zones"],
     )
 
 

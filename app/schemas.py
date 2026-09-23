@@ -1447,3 +1447,240 @@ class SerialScenarioGenerateResponse(BaseModel):
         ..., description="回显请求的场景标签顺序（轮转铺放顺序）",
     )
     scenarios: List[SerialScenario]
+
+
+# ---------------------------------------------------------------------------
+# POST /release-batch-gate
+# ---------------------------------------------------------------------------
+
+ReleaseZoneStatus = Literal["scheduled", "blocked"]
+ReleaseBlockReason = Literal["older_serial", "dependency_unsatisfied"]
+
+
+class ReleaseBatchReplica(ReplicaCurrent):
+    """单个副本：名称（zone 内不可重复）+ 当前 32 位无符号 SOA 序列号。"""
+
+
+class ReleaseBatchZone(BaseModel):
+    """单个待发布 zone：副本序列、拟发布目标与 zone 间前置依赖。"""
+
+    zone: str = Field(..., min_length=1, description="zone 标识（请求内不可重复）")
+    replicas: List[ReleaseBatchReplica] = Field(
+        ...,
+        min_length=1,
+        description="该 zone 的副本序列（至少 1 个；副本名在 zone 内不可重复）",
+    )
+    target: int = Field(..., description="拟发布的 32 位无符号 SOA 序列号")
+    requires: List[str] = Field(
+        default_factory=list,
+        description=(
+            "前置 zone 名列表：本 zone 只能在全部前置发布之后发布；"
+            "引用不存在的 zone、自依赖、重复项或依赖环均返回 422"
+        ),
+    )
+
+    @field_validator("zone")
+    @classmethod
+    def _zone_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("zone 标识不能为空")
+        return value
+
+    @field_validator("target", mode="before")
+    @classmethod
+    def _target_serial32(cls, value: object) -> int:
+        return _coerce_serial32(value)
+
+    @field_validator("requires", mode="before")
+    @classmethod
+    def _requires_list_of_non_blank_names(cls, value: object) -> List[str]:
+        # before 模式先看到原始 JSON 值：拒绝 bool / int 等被 pydantic 宽松
+        # 转成字符串的类型，保证依赖引用只能是真正的字符串
+        if not isinstance(value, list):
+            raise ValueError("requires 必须是 zone 名数组")
+        for name in value:
+            if not isinstance(name, str) or isinstance(name, bool):
+                raise ValueError("前置 zone 名必须是字符串")
+            if not name.strip():
+                raise ValueError("前置 zone 名不能为空")
+        return value
+
+
+class ReleaseBatchGateRequest(BaseModel):
+    """POST /release-batch-gate 请求体。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "zones": [
+                        {
+                            "zone": "example.com",
+                            "replicas": [
+                                {"name": "ns1", "current": 100},
+                                {"name": "ns2", "current": 98},
+                            ],
+                            "target": 110,
+                            "requires": [],
+                        },
+                        {
+                            "zone": "cdn.example.com",
+                            "replicas": [
+                                {"name": "ns1", "current": 105},
+                                {"name": "ns2", "current": 105},
+                            ],
+                            "target": 120,
+                            "requires": ["example.com"],
+                        },
+                        {
+                            "zone": "api.example.com",
+                            "replicas": [
+                                {"name": "ns1", "current": 4294967290},
+                                {"name": "ns2", "current": 4294967294},
+                            ],
+                            "target": 0,
+                            "requires": ["example.com"],
+                        },
+                    ]
+                },
+                {
+                    "zones": [
+                        {
+                            "zone": "blocked.example",
+                            "replicas": [
+                                {"name": "ns1", "current": 300},
+                                {"name": "ns2", "current": 200},
+                            ],
+                            "target": 250,
+                            "requires": [],
+                        },
+                        {
+                            "zone": "waiting.example",
+                            "replicas": [
+                                {"name": "ns1", "current": 40},
+                                {"name": "ns2", "current": 41},
+                            ],
+                            "target": 50,
+                            "requires": ["blocked.example"],
+                        },
+                    ]
+                },
+            ]
+        }
+    )
+
+    zones: List[ReleaseBatchZone] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "待发布 zone 列表（至少 1 个，顺序即结果中 zones 的输出顺序）"
+        ),
+    )
+
+
+class ReleaseBatchReplicaItem(BaseModel):
+    """单个 zone 内单个副本相对拟发布目标的 RFC 1982 审计结果。"""
+
+    index: int = Field(..., ge=0, description="副本在该 zone replicas 中的下标")
+    name: str = Field(..., description="副本名（回显请求值）")
+    current: int
+    target: int
+    relation: Relation = Field(
+        ...,
+        description=(
+            "RFC 1982 关系：newer（目标严格更新）/ equal（已在目标）/ "
+            "older（回退，阻塞）；ambiguous（正对点）在请求校验阶段即返回 422"
+        ),
+    )
+    forward_distance: int = Field(
+        ...,
+        ge=0,
+        le=MAX_SERIAL,
+        description="前向模距离 (target - current) mod 2^32（允许跨 2^32 回绕）",
+    )
+    blocking: bool = Field(
+        ..., description="是否为序列阻塞副本：relation 为 older 时为 true",
+    )
+
+
+class ReleaseBatchZoneItem(BaseModel):
+    """单个 zone 的分批发布判定结果（顺序与请求中的 zones 一致）。"""
+
+    zone: str
+    status: ReleaseZoneStatus = Field(
+        ...,
+        description=(
+            "scheduled：已编入批次；blocked：未编入任何批次"
+            "（自身序列阻塞或前置未齐，见 blocking_reason / blocked_by）"
+        ),
+    )
+    batch: Optional[int] = Field(
+        ...,
+        ge=1,
+        description="编入的批次号（从 1 开始，前置均在更早批次）；未编入为 null",
+    )
+    max_forward_distance: int = Field(
+        ...,
+        ge=0,
+        le=MAX_SERIAL,
+        description=(
+            "本 zone 全部副本相对目标的最大前向模距离（含 equal 副本的距离 0）"
+        ),
+    )
+    serial_ready: bool = Field(
+        ..., description="本 zone 副本序列是否可共同推进（无 older 阻塞副本）",
+    )
+    blocking_reason: Optional[ReleaseBlockReason] = Field(
+        ...,
+        description=(
+            "仅 status=blocked 时给出：older_serial（存在回退副本，自身序列不可"
+            "共同推进）或 dependency_unsatisfied（自身可发布但前置链上有未编入"
+            "批次的 zone）"
+        ),
+    )
+    blocked_by: List[str] = Field(
+        ...,
+        description=(
+            "前置中未编入批次的 zone 名（升序）；已编入批次或无前置时为空"
+        ),
+    )
+    replicas: List[ReleaseBatchReplicaItem] = Field(
+        ..., description="逐副本 RFC 1982 审计结果（请求顺序）",
+    )
+
+
+class ReleaseBatch(BaseModel):
+    """一个发布批次：可在同一轮共同发布的 zone 集合。"""
+
+    batch: int = Field(..., ge=1, description="批次号，从 1 开始连续编号")
+    zones: List[str] = Field(
+        ..., description="本批次发布的 zone 名（按名称升序）",
+    )
+
+
+class ReleaseBatchGateResponse(BaseModel):
+    """POST /release-batch-gate 响应体。"""
+
+    scheduled: bool = Field(
+        ..., description="是否全部 zone 都已编入批次（无任何阻塞）",
+    )
+    batch_count: int = Field(
+        ..., ge=0, description="发布批次总数（全部阻塞时为 0，batches 为空）",
+    )
+    max_forward_distance: int = Field(
+        ...,
+        ge=0,
+        le=MAX_SERIAL,
+        description=(
+            "已编入批次的 zone 中最大的前向模距离；无任何 zone 编入批次时为 0"
+        ),
+    )
+    batches: List[ReleaseBatch] = Field(
+        ..., description="确定性分批结果（批次号升序，批内 zone 名升序）",
+    )
+    zones: List[ReleaseBatchZoneItem] = Field(
+        ..., description="逐 zone 判定结果（保持请求中的 zones 顺序）",
+    )
+    blocked_zones: List[str] = Field(
+        ..., description="未编入批次的 zone 名（请求顺序）；全部编入时为空",
+    )

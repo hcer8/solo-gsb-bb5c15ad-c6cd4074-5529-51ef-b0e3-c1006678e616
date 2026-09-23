@@ -1537,3 +1537,335 @@ def evaluate_divergence_windows(
         # 观测结束仍未恢复：窗口保持开启
         windows.append((open_start, None, None, sorted(entry_serial.items())))
     return windows
+
+
+# ---------------------------------------------------------------------------
+# 多 zone 分批发布门禁（POST /release-batch-gate）
+# ---------------------------------------------------------------------------
+
+RELEASE_SCHEDULED = "scheduled"
+"""zone 副本序列全部可共同推进，且前置链上的每个 zone 同样可发布，已编入批次。"""
+
+RELEASE_BLOCKED = "blocked"
+"""zone 未编入任何批次：自身有序列阻塞副本，或前置链上存在不可发布的 zone。"""
+
+BLOCK_OLDER_SERIAL = "older_serial"
+"""zone 内存在拟发布目标相对其为回退（older）的副本，无法共同推进。"""
+
+BLOCK_DEPENDENCY_UNSATISFIED = "dependency_unsatisfied"
+"""前置链上存在未编入批次的 zone（本 zone 自身序列可能已可发布）。"""
+
+
+class ReleaseBatchValidationError(ValueError):
+    """多 zone 分批发布请求非法：重复 zone、依赖引用未知 zone、自依赖、
+    依赖环，或某 zone 的副本序列与拟发布目标不可比较（正对点）。"""
+
+    def __init__(self, detail: dict):
+        super().__init__(str(detail))
+        self.detail = detail
+
+
+def validate_release_batch_input(
+    zones: List[Tuple[str, List[int], int, List[str]]],
+) -> None:
+    """对多 zone 分批发布请求做整体结构校验（422）。
+
+    *zones* 与请求中的 zone 同序，每项为
+    ``(zone, [副本当前序列号], 拟发布目标, [前置 zone])``；前置列表在 schema
+    层已按原样保留（不去重）。
+
+    按以下顺序检查，命中即抛 :class:`ReleaseBatchValidationError`
+    （相同输入的报错确定可复现）：
+
+    1. zone 名重复（``duplicate_zone``，给出首次出现下标）；
+    2. 前置引用了不存在的 zone（``unknown_dependency``，按请求顺序给出首个）；
+    3. 自依赖（``self_dependency``，给出该 zone）；
+    4. 同一 zone 的前置列表内部重复（``duplicate_dependency``，给出重复项）；
+    5. 依赖 DAG 存在环（``dependency_cycle``，环规范化为从环中最小 zone 名起、
+       按依赖行进方向排列的序列，并在末尾再次给出起点）；
+    6. 逐 zone（请求顺序）检查副本序列与拟发布目标的 RFC 1982 可比较性：
+       任一副本与目标的前向距离恰为 2^31（正对点）即
+       ``incomparable_serials``（older 回退不在此列，作为 200 响应中的
+       阻塞原因 ``older_serial``）。
+    """
+    index_of: dict = {}
+    for index, (zone, _currents, _target, _prereqs) in enumerate(zones):
+        if zone in index_of:
+            raise ReleaseBatchValidationError(
+                {
+                    "error": "duplicate_zone",
+                    "message": f"zone {zone} 在请求中重复出现",
+                    "zone": zone,
+                    "first_index": index_of[zone],
+                    "index": index,
+                }
+            )
+        index_of[zone] = index
+
+    # 依赖引用未知 zone / 自依赖：按请求顺序逐条检查，首个违规即报错
+    for zone, _c, _t, prereqs in zones:
+        for prereq in prereqs:
+            if prereq not in index_of:
+                raise ReleaseBatchValidationError(
+                    {
+                        "error": "unknown_dependency",
+                        "message": (
+                            f"zone {zone} 的前置依赖 {prereq} 未出现在 zone 列表中"
+                        ),
+                        "zone": zone,
+                        "dependency": prereq,
+                    }
+                )
+            if prereq == zone:
+                raise ReleaseBatchValidationError(
+                    {
+                        "error": "self_dependency",
+                        "message": f"zone {zone} 不能把自身列为前置依赖",
+                        "zone": zone,
+                        "dependency": prereq,
+                    }
+                )
+
+    # 同一 zone 的前置列表内部重复
+    for zone, _c, _t, prereqs in zones:
+        seen: set = set()
+        for prereq in prereqs:
+            if prereq in seen:
+                raise ReleaseBatchValidationError(
+                    {
+                        "error": "duplicate_dependency",
+                        "message": (
+                            f"zone {zone} 的前置依赖 {prereq} 在依赖列表中重复"
+                        ),
+                        "zone": zone,
+                        "dependency": prereq,
+                    }
+                )
+            seen.add(prereq)
+
+    cycle = _find_dependency_cycle(zones)
+    if cycle is not None:
+        raise ReleaseBatchValidationError(
+            {
+                "error": "dependency_cycle",
+                "message": "zone 前置依赖存在环，无法在 DAG 上分批",
+                "cycle": cycle,
+                "cycle_edges": [
+                    {"zone": cycle[i], "requires": cycle[i + 1]}
+                    for i in range(len(cycle) - 1)
+                ],
+            }
+        )
+
+    # 不可比较序列：任一 zone 内存在与拟发布目标相差正好 2^31 的副本（正对点）
+    for zone, currents, target, _prereqs in zones:
+        for replica_index, current in enumerate(currents):
+            if compare_serial(current, target) == AMBIGUOUS:
+                raise ReleaseBatchValidationError(
+                    {
+                        "error": "incomparable_serials",
+                        "message": (
+                            f"zone {zone} 的副本（下标 {replica_index}）当前序列号"
+                            f" {current} 与拟发布目标 {target} 的前向距离恰为 2^31，"
+                            "按 RFC 1982 为正对点、不可比较"
+                        ),
+                        "zone": zone,
+                        "replica_index": replica_index,
+                        "current": current,
+                        "target": target,
+                        "forward_distance": HALF,
+                    }
+                )
+
+
+def _find_dependency_cycle(
+    zones: List[Tuple[str, List[int], int, List[str]]],
+) -> Optional[List[str]]:
+    """在前置依赖图中检测环路（迭代 DFS，支持任意深度的依赖链）。
+
+    边的方向为 **zone -> 其前置 zone**（zone 必须先等前置发布）。以请求顺序
+    遍历 DFS 起点、邻居按名称升序展开，命中回边时把环规范化为从**环中最小
+    zone 名**起、按依赖行进方向排列的序列，并在末尾再次给出起点（首尾相接
+    即环）。无环返回 None。
+    """
+    names = [zone for zone, _c, _t, _p in zones]
+    deps = {zone: sorted(prereqs) for zone, _c, _t, prereqs in zones}
+
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {zone: WHITE for zone in names}
+
+    for root in names:
+        if color[root] != WHITE:
+            continue
+        color[root] = GRAY
+        path = [root]
+        path_pos = {root: 0}
+        # 显式栈：(节点, 按名升序的邻居迭代器)
+        stack: List[Tuple[str, object]] = [(root, iter(deps[root]))]
+        while stack:
+            node, neighbors = stack[-1]
+            nxt = next(neighbors, None)  # type: ignore[arg-type]
+            if nxt is None:
+                color[node] = BLACK
+                stack.pop()
+                path.pop()
+                del path_pos[node]
+            elif color[nxt] == GRAY:
+                cycle = path[path_pos[nxt]:]
+                start = min(range(len(cycle)), key=lambda i: cycle[i])
+                ordered = cycle[start:] + cycle[:start]
+                return ordered + [ordered[0]]
+            elif color[nxt] == WHITE:
+                color[nxt] = GRAY
+                path_pos[nxt] = len(path)
+                path.append(nxt)
+                stack.append((nxt, iter(deps[nxt])))
+    return None
+
+
+def evaluate_release_batch_gate(
+    zones: List[Tuple[str, List[int], int, List[str]]],
+) -> dict:
+    """按 RFC 1982 判定各 zone 可否共同推进，并在依赖 DAG 上确定性分批。
+
+    前置：*zones* 已通过 :func:`validate_release_batch_input`
+    （无重复 zone / 未知依赖 / 自依赖 / 重复依赖 / 依赖环 / 正对点副本）。
+
+    第一步，逐 zone 审计其副本序列相对拟发布目标：
+
+    * 每个副本给出 RFC 1982 关系与前向模距离；关系为 ``older`` 的副本是
+      **序列阻塞副本**（``equal`` 与 ``newer`` 不阻塞；``ambiguous`` 已在
+      输入校验阶段以 422 拒绝）；
+    * ``serial_ready`` 当且仅当该 zone 没有序列阻塞副本；
+    * ``max_forward_distance`` 为该 zone 全部副本前向距离的最大值
+      （含 equal 副本的距离 0；跨 2^32 回绕的推进距离为小的前向值）。
+
+    第二步，在依赖 DAG（zone -> 前置 zone）上分层：一个 ``serial_ready``
+    的 zone 仅当其**全部前置**（含传递前置）都被编入批次时才可发布。
+    批次号即每个可发布 zone 相对其前置的最长路径层数：
+
+    * 第 1 批：无前置且自身可发布；
+    * 第 k+1 批：全部前置都在第 ≤ k 批、且至少一个前置恰在第 k 批。
+
+    自身序列阻塞、或前置链上存在未编入批次 zone 的 zone 标记为
+    ``blocked``：``reason`` 区分 ``older_serial``（自身有序列阻塞副本，
+    即使前置均已发布也不能发）与 ``dependency_unsatisfied``
+    （自身可发布但前置未齐）；``blocked_by`` 给出其前置中未编入批次的
+    zone 名（升序）。
+
+    返回可直接序列化为响应模型的 dict：``batches`` 按批次号升序，每批内
+    zone 名升序；``zones`` 保持请求顺序。结果完全确定，相同输入恒得相同输出。
+    """
+    names = [zone for zone, _c, _t, _p in zones]
+
+    # 第一步：逐 zone 的 RFC 1982 审计
+    serial_ready: dict = {}
+    max_distance: dict = {}
+    replica_results: dict = {}
+    for zone, currents, target, _prereqs in zones:
+        items = []
+        ready = True
+        worst = 0
+        for replica_index, current in enumerate(currents):
+            relation = compare_serial(current, target)
+            distance = forward_distance(current, target)
+            if relation == OLDER:
+                ready = False
+            if distance > worst:
+                worst = distance
+            items.append(
+                {
+                    "index": replica_index,
+                    "current": current,
+                    "target": target,
+                    "relation": relation,
+                    "forward_distance": distance,
+                    "blocking": relation == OLDER,
+                }
+            )
+        serial_ready[zone] = ready
+        max_distance[zone] = worst
+        replica_results[zone] = items
+
+    # 第二步：依赖 DAG 分层（前置已去重），迭代 Kahn 处理任意深度的链。
+    # level[z] = 1 + max(level[p])；不可发布 zone 不占层，其后继即使自身
+    # ready 也无法满足全部前置。对可发布 zone 计数其**全部**前置：
+    # 不可发布前置永远不会获得层级，故相关 zone 永远不会进入 frontier。
+    deps = {
+        zone: sorted(set(prereqs)) for zone, _c, _t, prereqs in zones
+    }
+    level: dict = {name: None for name in names}
+    dependents: dict = {name: [] for name in names}
+    pending: dict = {
+        name: (len(deps[name]) if serial_ready[name] else -1) for name in names
+    }
+    for name in names:
+        for prereq in deps[name]:
+            dependents[prereq].append(name)
+    # 当前无待就位前置的可发布 zone 组成第 1 批
+    frontier = sorted(name for name in names if pending[name] == 0)
+    while frontier:
+        node = frontier.pop()
+        prereq_levels = [level[p] for p in deps[node]]
+        level[node] = 1 + max(prereq_levels) if prereq_levels else 1
+        # 通知以 node 为前置的可发布后继
+        for other in dependents[node]:
+            if pending[other] > 0:
+                pending[other] -= 1
+                if pending[other] == 0:
+                    frontier.append(other)
+
+    batches_map: dict = {}
+    for name in names:
+        if level[name] is not None:
+            batches_map.setdefault(level[name], []).append(name)
+    batches = [
+        {
+            "batch": batch_no,
+            "zones": sorted(batches_map[batch_no]),
+        }
+        for batch_no in sorted(batches_map)
+    ]
+
+    zone_items = []
+    top_worst = 0
+    all_scheduled = True
+    blocked_zones: List[str] = []
+    for name in names:
+        if level[name] is not None:
+            batch_no = level[name]
+            reason = None
+            blocked_by: List[str] = []
+            if max_distance[name] > top_worst:
+                top_worst = max_distance[name]
+        else:
+            batch_no = None
+            reason = (
+                BLOCK_OLDER_SERIAL
+                if not serial_ready[name]
+                else BLOCK_DEPENDENCY_UNSATISFIED
+            )
+            blocked_by = sorted(p for p in deps[name] if level[p] is None)
+            all_scheduled = False
+            blocked_zones.append(name)
+        zone_items.append(
+            {
+                "zone": name,
+                "status": RELEASE_SCHEDULED if batch_no is not None else RELEASE_BLOCKED,
+                "batch": batch_no,
+                "max_forward_distance": max_distance[name],
+                "serial_ready": serial_ready[name],
+                "blocking_reason": reason,
+                "blocked_by": blocked_by,
+                "replicas": replica_results[name],
+            }
+        )
+
+    return {
+        "scheduled": all_scheduled,
+        "batch_count": len(batches),
+        "max_forward_distance": top_worst,
+        "batches": batches,
+        "zones": zone_items,
+        "blocked_zones": blocked_zones,
+    }

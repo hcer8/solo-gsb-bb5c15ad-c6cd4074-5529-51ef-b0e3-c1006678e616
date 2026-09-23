@@ -10,7 +10,11 @@
 对多个镜像上报的无序 IXFR 清单按完整三元组（含内容摘要）
 做法定人数计票与可信链共识审计，
 并能按 seed 确定性生成跨回绕 / 正对点 / 分叉 / 环路的
-RFC 1982 边界场景样本，供上述端点复现测试。
+RFC 1982 边界场景样本，供上述端点复现测试；
+此外可对多个 zone 的副本序列与拟发布目标按 RFC 1982 判定
+是否可共同推进、计算每个 zone 的最大前向距离，
+并在 zone 间前置依赖 DAG 上确定性分批发布，
+对依赖环、重复 zone、不可比较序列等非法输入给出结构化错误。
 
 ## 一条命令启动（Docker Compose）
 
@@ -28,6 +32,24 @@ docker compose up --build -d
 
 ```bash
 docker compose down
+```
+
+启动后可用新端点快速验证（依赖 DAG 上的两批发布；返回
+`batch_count: 2` 即服务正常）：
+
+```bash
+curl -s http://localhost:8000/release-batch-gate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "zones": [
+      {"zone": "example.com",
+       "replicas": [{"name": "ns1", "current": 100}],
+       "target": 110},
+      {"zone": "cdn.example.com",
+       "replicas": [{"name": "ns1", "current": 105}],
+       "target": 120, "requires": ["example.com"]}
+    ]
+  }'
 ```
 
 > 无 Docker 时本地运行：`pip install -r requirements.txt && uvicorn app.main:app --host 0.0.0.0 --port 8000`
@@ -922,6 +944,180 @@ curl -s http://localhost:8000/delta-consensus \
 为空、`target_reachable=false`、`chain_reason="gap"`，所有上报按票数计入
 `extra_edges`）。
 
+### `POST /release-batch-gate` — 多 zone 分批发布门禁
+
+一次请求给出**多个 zone**：每个 zone 携带其副本当前序列号 `replicas`
+（zone 内副本名不可重复，但不同 zone 允许同名）、拟发布目标 `target`
+与前置依赖 `requires`（zone 名列表：本 zone 只能在**全部前置都已发布**
+之后发布）。服务先按 RFC 1982 判定每个 zone 的副本序列能否共同推进到目标
+并计算该 zone 的最大前向距离，再在 zone 间前置依赖 **DAG** 上确定性分批。
+
+**第一步：整体校验（422 结构化错误）**
+
+| `error` | 触发条件 | 关键字段 |
+|---|---|---|
+| `duplicate_zone` | zone 名在请求中重复 | `zone` / `first_index` / `index` |
+| `unknown_dependency` | `requires` 引用了不在 zone 列表中的名字 | `zone` / `dependency` |
+| `self_dependency` | zone 把自身列为前置 | `zone` / `dependency` |
+| `duplicate_dependency` | 同一 zone 的 `requires` 列表内部重复 | `zone` / `dependency` |
+| `dependency_cycle` | 前置依赖存在环，无法在 DAG 上分批 | `cycle`（从环中最小 zone 名起、按依赖方向、首尾相接）与 `cycle_edges` |
+| `incomparable_serials` | 某 zone 任一副本当前值与目标前向距离**恰为 2³¹**（正对点，RFC 1982 不可比较） | `zone` / `replica_index` / `current` / `target` / `forward_distance` |
+| `duplicate_replica_name` | 单个 zone 内副本名重复 | `zone` / `name` |
+
+> 注意区分：副本相对目标为 **`older`（回退）不是 422**——它是合法可比较
+> 状态，作为 **200 响应中的阻塞原因** `older_serial` 返回；只有正对点
+> `ambiguous`（不可比较）才是结构化错误。校验顺序固定为
+> 重复 zone → 未知依赖 → 自依赖 → 重复依赖 → 依赖环 → 不可比较序列，
+> 相同输入的报错完全确定。
+
+**第二步：逐 zone RFC 1982 审计**
+
+每个副本给出 `relation` / `forward_distance` / `blocking`：
+`newer` 与 `equal`（距离 0）不阻塞，`older` 为**序列阻塞副本**。
+zone 的 `max_forward_distance` 是其全部副本前向模距离的最大值
+（跨 2³² 回绕推进如 `4294967295 -> 0` 距离为 1）；`serial_ready=true`
+当且仅当没有回退副本。
+
+**第三步：依赖 DAG 确定性分层**
+
+批次号即每个可发布 zone 相对前置的**最长路径层数**：
+
+- 第 1 批：无前置且自身可共同推进；
+- 第 k+1 批：全部前置都在第 ≤ k 批，且至少一个前置恰在第 k 批；
+- 自身存在回退副本的 zone：`status="blocked"`、
+  `blocking_reason="older_serial"`（即使前置均已发布也不能发）；
+- 自身可发布但前置链上有未编入批次的 zone：
+  `blocking_reason="dependency_unsatisfied"`，`blocked_by` 列出其直接前置中
+  未就位的 zone（按名升序）；两者同时成立时优先报 `older_serial`。
+
+`batches` 按批次号升序、批内 zone 名升序；`zones` 保持请求中的 zone 顺序。
+顶层 `max_forward_distance` 只统计**已编入批次**的 zone（无批次时为 0）。
+
+请求（三个 zone；`api.example.com` 从 `4294967290 / 4294967294` 回绕推进
+到 `0`，距离仅 6 / 2）：
+
+```bash
+curl -s http://localhost:8000/release-batch-gate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "zones": [
+      {"zone": "example.com",
+       "replicas": [{"name": "ns1", "current": 100},
+                    {"name": "ns2", "current": 98}],
+       "target": 110, "requires": []},
+      {"zone": "cdn.example.com",
+       "replicas": [{"name": "ns1", "current": 105}],
+       "target": 120, "requires": ["example.com"]},
+      {"zone": "api.example.com",
+       "replicas": [{"name": "ns1", "current": 4294967290},
+                    {"name": "ns2", "current": 4294967294}],
+       "target": 0, "requires": ["example.com"]}
+    ]
+  }'
+```
+
+响应（`example.com` 第 1 批；两个后继在第 2 批同批发布，批内按名升序）：
+
+```json
+{
+  "scheduled": true,
+  "batch_count": 2,
+  "max_forward_distance": 15,
+  "batches": [
+    {"batch": 1, "zones": ["example.com"]},
+    {"batch": 2, "zones": ["api.example.com", "cdn.example.com"]}
+  ],
+  "zones": [
+    {"zone": "example.com", "status": "scheduled", "batch": 1,
+     "max_forward_distance": 12, "serial_ready": true,
+     "blocking_reason": null, "blocked_by": [],
+     "replicas": [
+       {"index": 0, "name": "ns1", "current": 100, "target": 110,
+        "relation": "newer", "forward_distance": 10, "blocking": false},
+       {"index": 1, "name": "ns2", "current": 98, "target": 110,
+        "relation": "newer", "forward_distance": 12, "blocking": false}]},
+    {"zone": "cdn.example.com", "status": "scheduled", "batch": 2,
+     "max_forward_distance": 15, "serial_ready": true,
+     "blocking_reason": null, "blocked_by": [],
+     "replicas": [
+       {"index": 0, "name": "ns1", "current": 105, "target": 120,
+        "relation": "newer", "forward_distance": 15, "blocking": false}]},
+    {"zone": "api.example.com", "status": "scheduled", "batch": 2,
+     "max_forward_distance": 6, "serial_ready": true,
+     "blocking_reason": null, "blocked_by": [],
+     "replicas": [
+       {"index": 0, "name": "ns1", "current": 4294967290, "target": 0,
+        "relation": "newer", "forward_distance": 6, "blocking": false},
+       {"index": 1, "name": "ns2", "current": 4294967294, "target": 0,
+        "relation": "newer", "forward_distance": 2, "blocking": false}]}
+  ],
+  "blocked_zones": []
+}
+```
+
+阻塞沿依赖链级联（`blocked.example` 的 ns1 相对目标回退；后继即使自身
+序列就绪也不能发布）——请求仍返回 **200**，阻塞信息在响应体内：
+
+```bash
+curl -s http://localhost:8000/release-batch-gate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "zones": [
+      {"zone": "blocked.example",
+       "replicas": [{"name": "ns1", "current": 300},
+                    {"name": "ns2", "current": 200}],
+       "target": 250, "requires": []},
+      {"zone": "waiting.example",
+       "replicas": [{"name": "ns1", "current": 40},
+                    {"name": "ns2", "current": 41}],
+       "target": 50, "requires": ["blocked.example"]}
+    ]
+  }'
+# scheduled: false, batch_count: 0, max_forward_distance: 0, batches: [],
+# blocked_zones: ["blocked.example", "waiting.example"]
+# blocked.example: status "blocked", blocking_reason "older_serial"
+#   （ns1 relation "older"、blocking true）
+# waiting.example: status "blocked",
+#   blocking_reason "dependency_unsatisfied", blocked_by ["blocked.example"]
+```
+
+依赖环返回 **422**（环规范化为从最小 zone 名起、按依赖方向、首尾相接）：
+
+```bash
+curl -s http://localhost:8000/release-batch-gate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "zones": [
+      {"zone": "a", "replicas": [{"name": "r", "current": 1}],
+       "target": 3, "requires": ["b"]},
+      {"zone": "b", "replicas": [{"name": "r", "current": 1}],
+       "target": 3, "requires": ["a"]}
+    ]
+  }'
+# 422 {"detail": {"error": "dependency_cycle",
+#   "cycle": ["a", "b", "a"],
+#   "cycle_edges": [{"zone": "a", "requires": "b"},
+#                   {"zone": "b", "requires": "a"}]}}
+```
+
+正对点不可比较同样返回 **422**（前向距离恰为 2³¹）：
+
+```bash
+curl -s http://localhost:8000/release-batch-gate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "zones": [
+      {"zone": "a",
+       "replicas": [{"name": "r1", "current": 0},
+                    {"name": "r2", "current": 1}],
+       "target": 2147483648}
+    ]
+  }'
+# 422 {"detail": {"error": "incomparable_serials", "zone": "a",
+#   "replica_index": 0, "current": 0, "target": 2147483648,
+#   "forward_distance": 2147483648, ...}}
+```
+
 ### `POST /serial-scenarios/generate` — 确定性 RFC 1982 边界场景生成
 
 为上述审计 / 规划端点批量生成**可复现**的边界测试输入。请求给出 32 位无符号
@@ -1079,7 +1275,8 @@ curl -s http://localhost:8000/serial-scenarios/generate \
 - 序列号越界：必须为整数且在 `[0, 4294967295]`（即 `[0, 2^32-1]`）；
 - 副本名重复（`/audit`、`/propose`、`/transfer-plan`、`/retention-plan`、
   `/domain-retention-plan`、`/rollout-gate`、`/propagation-slo`、
-  `/divergence-windows`、`/delta-consensus` 均检查）；
+  `/divergence-windows`、`/delta-consensus` 均检查；
+  `/release-batch-gate` 在**每个 zone 内部**检查，不同 zone 允许同名）；
 - 副本名为空 / `replicas` 为空数组；
 - `/transfer-plan` 额外检查：增量非严格 newer（`delta_not_strictly_newer`）、
   同一 `from_serial` 分叉（`delta_fork`）；
@@ -1116,6 +1313,16 @@ curl -s http://localhost:8000/serial-scenarios/generate \
   必须在 `[1, 12]`、`scenario_count` 必须在 `[1, 32]`（非整数同样拒绝）；
   `include` 必须是非空、无重复、元素仅限 `wrap` / `ambiguous` / `fork` /
   `loop` 的标签子集（空数组、未知标签、重复标签或缺字段均返回 422）。
+- `/release-batch-gate` 额外检查：`zones` 至少 1 个，每个 zone 至少 1 个
+  副本；zone 名非空且**请求内不可重复**（`duplicate_zone`，含首次出现
+  下标）；单个 zone 内副本名不可重复（`duplicate_replica_name`，错误体含
+  `zone`）；`target` / 副本 `current` 必须是合法序列号；`requires` 元素
+  必须是非空字符串，引用未知 zone 返回 422（`unknown_dependency`）、
+  自依赖（`self_dependency`）、同一列表内重复（`duplicate_dependency`）
+  与依赖环（`dependency_cycle`，给出从最小 zone 名起首尾相接的 `cycle`）
+  均返回 422；任一副本与目标前向距离恰为 `2^31`（正对点不可比较）返回
+  422 `incomparable_serials`（含 zone、副本下标与冲突值）。回退副本
+  （`older`）不是 422，而是 200 响应中的阻塞原因 `older_serial`。
 
 ## 算法说明
 
@@ -1214,6 +1421,22 @@ priority 作为常量并入各域基值；对每个可行子集统计各域被�
 （含票数与可信摘要对照）、其余上报为 `extra_edges`（含票数），各列表内部
 统一按三元组 / 序号对升序，连同 `voters` 名称升序，相同输入恒得相同结果。
 
+`/release-batch-gate` 中，`validate_release_batch_input` 按固定顺序做整体
+校验：重复 zone（记录首次出现下标）→ 前置引用未知 zone → 自依赖 →
+同一前置列表内部重复 → 依赖环 → 不可比较序列。依赖环由 `_find_dependency_cycle`
+在 **zone → 前置 zone** 图上以请求顺序为 DFS 起点、邻居按名升序展开检测；
+命中回边时把环旋转为从环中**最小 zone 名**起、按依赖行进方向排列并在末尾
+重复起点，跨进程结果稳定。正对点判定复用
+`compare_serial(...) == "ambiguous"`（前向距离恰为 2³¹）；`older` 回退不
+在校验阶段拒绝。通过校验后 `evaluate_release_batch_gate` 先逐副本计算
+关系与前向模距离，汇总每 zone 的 `serial_ready` 与
+`max_forward_distance`；再以记忆化 DFS 在 DAG 上求每个 zone 相对前置的
+**最长路径层数**——自身不就绪或任一前置层级为 None 的 zone 不可发布
+（阻塞沿传递依赖级联），其余 zone 按层号归入批次。阻塞原因中
+`older_serial` 优先于 `dependency_unsatisfied`，`blocked_by` 只列直接
+前置里未编入批次者（升序）；批次按层号、批内按 zone 名、逐 zone 按请求
+顺序输出，顶层最大前向距离只统计已编入批次的 zone，相同输入恒得相同结果。
+
 `/serial-scenarios/generate` 中（纯函数模块 `app/scenarios.py`，零第三方
 依赖），标签层先按 `include` 的请求顺序对 `scenario_count` 个位置做与 seed
 无关的轮转铺放（故每个被请求标签在前 `len(include)` 个场景至少出现一次）；
@@ -1254,7 +1477,14 @@ covered/total 汇总与稳定性测试，以及 `/rollout-gate` 的时间戳排�
 标签轮转与 seed 无关性、独立整数混合播种、32 位范围与乱序样本、
 wrap / ambiguous / fork / loop 四类场景与现有 RFC 1982 逻辑的交叉验证
 （ixfr 跨回绕、target_incomparable、delta_fork、axfr/loop）、
-数量 / seed / include 的 422 校验与端到端路由测试）：
+数量 / seed / include 的 422 校验与端到端路由测试，
+以及 `/release-batch-gate` 的重复 zone / 未知依赖 / 自依赖 /
+重复依赖 / 依赖环（含环规范化起点与从无关根进入）/ 正对点不可比较
+结构化 422 校验、older 回退不报错而作为阻塞原因、单 zone 审计与
+最大前向距离（含跨 2³² 回绕与 equal 距离 0）、DAG 分层（线性链 /
+菱形 / 最长路径层级）、older_serial 与 dependency_unsatisfied
+级联阻塞及 blocked_by 语义、部分可调度分支、requires 顺序无关性
+与确定性、逐 zone 422 路由与 OpenAPI 示例测试）：
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -1269,13 +1499,14 @@ python3 -m unittest discover -s tests -v
 │   ├── main.py        # FastAPI 路由与异常（/audit、/propose、/transfer-plan、
 │   │                  #   /retention-plan、/domain-retention-plan、/rollout-gate、
 │   │                  #   /propagation-slo、/divergence-windows、/delta-consensus、
-│   │                  #   /serial-scenarios/generate）
+│   │                  #   /release-batch-gate、/serial-scenarios/generate）
 │   ├── schemas.py     # 请求/响应模型与 422 校验（含 /rollout-gate、
-│   │                  #   /propagation-slo、/divergence-windows、/delta-consensus
-│   │                  #   与 /serial-scenarios/generate 的 OpenAPI 示例）
+│   │                  #   /propagation-slo、/divergence-windows、/delta-consensus、
+│   │                  #   /release-batch-gate 与 /serial-scenarios/generate
+│   │                  #   的 OpenAPI 示例）
 │   ├── serial.py      # RFC 1982 环形算术、增量链规划、保留规划、上线门禁
-│   │                  #   与传播 SLO 评估、分裂窗口扫掠、增量共识
-│   │                  #   （纯函数，零第三方依赖）
+│   │                  #   与传播 SLO 评估、分裂窗口扫掠、增量共识、
+│   │                  #   多 zone 分批发布门禁（纯函数，零第三方依赖）
 │   └── scenarios.py   # 确定性伪随机边界场景生成（wrap / ambiguous /
 │                      #   fork / loop；纯函数，仅依赖标准库 random）
 ├── tests/test_serial.py
@@ -1286,6 +1517,7 @@ python3 -m unittest discover -s tests -v
 ├── tests/test_propagation_slo.py
 ├── tests/test_divergence_windows.py
 ├── tests/test_delta_consensus.py
+├── tests/test_release_batch_gate.py
 ├── tests/test_serial_scenarios.py
 ├── requirements.txt
 ├── Dockerfile
