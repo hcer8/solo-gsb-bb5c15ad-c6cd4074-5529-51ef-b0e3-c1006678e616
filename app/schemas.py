@@ -1447,3 +1447,181 @@ class SerialScenarioGenerateResponse(BaseModel):
         ..., description="回显请求的场景标签顺序（轮转铺放顺序）",
     )
     scenarios: List[SerialScenario]
+
+
+# ---------------------------------------------------------------------------
+# POST /release-batch-gate
+# ---------------------------------------------------------------------------
+
+ReleaseZoneStatus = Literal["ready", "blocked"]
+ReleaseBlockReason = Literal["target_not_newer", "dependency_blocked"]
+
+
+class ReleaseZone(BaseModel):
+    """单个待发布 zone：拟发布目标 + 各副本当前序列号 + 前置依赖 zone。"""
+
+    name: str = Field(..., min_length=1, description="zone 名称（不可重复）")
+    target: int = Field(..., description="该 zone 拟发布的 32 位无符号 SOA 序列号")
+    replicas: List[ReplicaCurrent] = Field(
+        ...,
+        min_length=1,
+        description="该 zone 的副本列表（至少一个；副本名不可重复）",
+    )
+    depends_on: List[str] = Field(
+        default_factory=list,
+        description=(
+            "前置依赖 zone 名列表：这些 zone 必须排入更早批次发布后本 zone "
+            "才能发布；不可重复，且必须出现在请求的 zones 中"
+        ),
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("zone 名称不能为空")
+        return value
+
+    @field_validator("target", mode="before")
+    @classmethod
+    def _target_serial32(cls, value: object) -> int:
+        return _coerce_serial32(value)
+
+    @field_validator("depends_on")
+    @classmethod
+    def _depends_on_valid(cls, value: List[str]) -> List[str]:
+        for dep in value:
+            if not dep.strip():
+                raise ValueError("依赖的 zone 名不能为空")
+        if len(set(value)) != len(value):
+            raise ValueError("depends_on 中的依赖 zone 不能重复")
+        return value
+
+
+class ReleaseBatchGateRequest(BaseModel):
+    """POST /release-batch-gate 请求体。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "zones": [
+                        {
+                            "name": "example.com",
+                            "target": 2024092102,
+                            "replicas": [
+                                {"name": "ns-a", "current": 2024092101},
+                                {"name": "ns-b", "current": 2024092100},
+                            ],
+                        },
+                        {
+                            "name": "api.example.com",
+                            "target": 105,
+                            "depends_on": ["example.com"],
+                            "replicas": [
+                                {"name": "ns-c", "current": 100},
+                                {"name": "ns-d", "current": 104},
+                            ],
+                        },
+                        {
+                            "name": "static.example.com",
+                            "target": 8,
+                            "replicas": [{"name": "ns-e", "current": 8}],
+                        },
+                    ]
+                },
+                {
+                    "zones": [
+                        {
+                            "name": "wrap.example",
+                            "target": 2,
+                            "replicas": [
+                                {"name": "ns-a", "current": 4294967294},
+                                {"name": "ns-b", "current": 4294967295},
+                            ],
+                        },
+                        {
+                            "name": "lagging.example",
+                            "target": 50,
+                            "depends_on": ["wrap.example"],
+                            "replicas": [{"name": "ns-c", "current": 60}],
+                        },
+                    ]
+                },
+            ]
+        }
+    )
+
+    zones: List[ReleaseZone] = Field(
+        ..., min_length=1, description="待发布的 zone 列表（至少一个；zone 名不可重复）",
+    )
+
+
+class ReleaseZoneReplicaItem(BaseModel):
+    """zone 内单个副本相对目标的推进判定（顺序与请求中的副本一致）。"""
+
+    name: str
+    current: int
+    relation: Relation
+    forward_distance: int = Field(
+        ..., ge=0, le=MAX_SERIAL,
+        description="前向模距离 (target - current) mod 2^32",
+    )
+    blocking: bool = Field(
+        ..., description="是否阻塞本 zone 发布：relation 为 older 即为 true",
+    )
+
+
+class ReleaseZoneItem(BaseModel):
+    """单个 zone 的分批发布门禁结果（顺序与请求中的 zones 一致）。"""
+
+    name: str
+    target: int
+    status: ReleaseZoneStatus = Field(
+        ...,
+        description=(
+            "ready：串行可行且全部依赖已排入更早批次，可随批次发布；"
+            "blocked：未排入批次（原因见 reasons）"
+        ),
+    )
+    max_forward_distance: int = Field(
+        ..., ge=0, le=MAX_SERIAL,
+        description="全部副本前向模距离的最大值（共同推进到目标的最大环形距离）",
+    )
+    batch: Optional[int] = Field(
+        ..., description="排入的批次下标（从 0 开始）；未排入批次为 null",
+    )
+    reasons: List[ReleaseBlockReason] = Field(
+        ...,
+        description=(
+            "阻塞原因：target_not_newer（存在相对目标为 older 的副本）/"
+            "dependency_blocked（存在未排入批次的直接依赖）；ready 时为空"
+        ),
+    )
+    blocking_replicas: List[str] = Field(
+        ..., description="相对目标为 older 的副本名（输入顺序）",
+    )
+    blocking_dependencies: List[str] = Field(
+        ..., description="未排入批次的直接依赖 zone 名（depends_on 声明顺序）",
+    )
+    replicas: List[ReleaseZoneReplicaItem]
+
+
+class ReleaseBatch(BaseModel):
+    """一个发布批次：同批 zone 可并行发布，批间严格按依赖先后。"""
+
+    index: int = Field(..., ge=0, description="批次下标（从 0 开始）")
+    zones: List[str] = Field(..., description="本批发布的 zone 名（按名称升序）")
+
+
+class ReleaseBatchGateResponse(BaseModel):
+    """POST /release-batch-gate 响应体。"""
+
+    zone_count: int = Field(..., ge=1, description="请求中的 zone 总数")
+    releasable: bool = Field(
+        ..., description="全部 zone 都排入批次（无任何阻塞）时为 true",
+    )
+    batches: List[ReleaseBatch] = Field(
+        ..., description="确定性分批结果（按批次下标升序；批内按 zone 名升序）",
+    )
+    zones: List[ReleaseZoneItem]

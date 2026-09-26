@@ -37,6 +37,11 @@ from .schemas import (
     ProposeItem,
     ProposeRequest,
     ProposeResponse,
+    ReleaseBatch,
+    ReleaseBatchGateRequest,
+    ReleaseBatchGateResponse,
+    ReleaseZoneItem,
+    ReleaseZoneReplicaItem,
     RetainedDelta,
     RetentionPlanItem,
     RetentionPlanRequest,
@@ -69,9 +74,11 @@ from .serial import (
     MirrorReportError,
     ObservationOrderError,
     plan_domain_retention,
+    plan_release_batches,
     plan_retention,
     plan_transfer,
     propose_serial,
+    ReleaseBatchError,
     ReleaseOrderError,
     validate_mirror_reports,
 )
@@ -87,9 +94,11 @@ app = FastAPI(
         "评估每次发布在各故障域间的传播收敛时延（SLO），"
         "沿时间线检测各副本序列号无可共同推进候选的分裂窗口，"
         "对多镜像上报的 IXFR 增量按完整三元组做法定人数共识审计，"
+        "对多 zone 的拟发布目标按 RFC 1982 逐区判定共同推进并在依赖 DAG 上"
+        "确定性分批发布，"
         "并可确定性生成覆盖回绕 / 正对点 / 分叉 / 环路边界的可复现场景样本。"
     ),
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -817,4 +826,97 @@ def serial_scenarios_generate(
         scenario_count=request.scenario_count,
         include=request.include,
         scenarios=[SerialScenario.model_validate(item) for item in scenarios],
+    )
+
+
+@app.post("/release-batch-gate", response_model=ReleaseBatchGateResponse)
+def release_batch_gate(request: ReleaseBatchGateRequest) -> ReleaseBatchGateResponse:
+    """分批发布门禁：逐 zone 按 RFC 1982 判定共同推进，再在依赖 DAG 上确定性分批。
+
+    每个 zone 携带自己的拟发布目标 ``target``、各副本当前序列号与前置依赖
+    ``depends_on``（这些 zone 必须先于本 zone 发布）。整体校验（422，按序
+    检查，报错确定可复现）：
+
+    * zone 名重复：``duplicate_zone_name``；zone 内副本名重复：
+      ``duplicate_replica_name``；
+    * 依赖未在请求中出现的 zone：``unknown_dependency``；
+    * 依赖环（含自依赖）：``dependency_cycle``，给出规范化环路径
+      （从字典序最小节点开始）；
+    * 任一副本与目标不可比较（正对点，前向距离恰为 2^31）：
+      ``serial_incomparable``（含 zone、副本与双方序列号）。
+
+    逐 zone 判定各副本相对目标的关系并取最大前向距离
+    ``max_forward_distance``：``newer`` / ``equal`` 不阻塞（``equal``
+    表示该副本已在目标值，无需推进），``older`` 阻塞——发布会回退该
+    副本，zone 记 ``target_not_newer`` 并列出 ``blocking_replicas``。
+
+    分批（Kahn 分层，确定性）：第 0 批为全部串行可行且无依赖的 zone；
+    第 k 批为全部串行可行、且全部依赖都已排入更早批次的 zone；批内按
+    zone 名升序。串行受阻的 zone 不排批；依赖链上存在未排批 zone 的
+    zone 同样不排批并记 ``dependency_blocked``（``blocking_dependencies``
+    给出未排批的直接依赖）。顶层 ``releasable`` 当且仅当全部 zone 都
+    排入批次。相同输入恒得相同分批。
+    """
+    for zone in request.zones:
+        _check_duplicate_names([r.name for r in zone.replicas])
+
+    try:
+        batches, results = plan_release_batches(
+            [
+                (
+                    zone.name,
+                    zone.target,
+                    [(r.name, r.current) for r in zone.replicas],
+                    list(zone.depends_on),
+                )
+                for zone in request.zones
+            ]
+        )
+    except ReleaseBatchError as exc:
+        raise HTTPException(status_code=422, detail=exc.detail)
+
+    items = []
+    for zone, result in zip(request.zones, results):
+        (
+            status,
+            max_distance,
+            batch,
+            reasons,
+            blocking_replicas,
+            blocking_dependencies,
+            replica_items,
+        ) = result
+        items.append(
+            ReleaseZoneItem(
+                name=zone.name,
+                target=zone.target,
+                status=status,
+                max_forward_distance=max_distance,
+                batch=batch,
+                reasons=reasons,
+                blocking_replicas=blocking_replicas,
+                blocking_dependencies=blocking_dependencies,
+                replicas=[
+                    ReleaseZoneReplicaItem(
+                        name=r_name,
+                        current=r_current,
+                        relation=relation,
+                        forward_distance=distance,
+                        blocking=blocking,
+                    )
+                    for r_name, r_current, relation, distance, blocking in (
+                        replica_items
+                    )
+                ],
+            )
+        )
+
+    return ReleaseBatchGateResponse(
+        zone_count=len(request.zones),
+        releasable=all(batch is not None for _s, _m, batch, *_r in results),
+        batches=[
+            ReleaseBatch(index=index, zones=names)
+            for index, names in enumerate(batches)
+        ],
+        zones=items,
     )

@@ -1537,3 +1537,261 @@ def evaluate_divergence_windows(
         # 观测结束仍未恢复：窗口保持开启
         windows.append((open_start, None, None, sorted(entry_serial.items())))
     return windows
+
+
+# ---------------------------------------------------------------------------
+# 分批发布门禁（POST /release-batch-gate）
+# ---------------------------------------------------------------------------
+
+READY = "ready"
+"""zone 串行可行且全部前置依赖已排入更早批次，可随批次发布。"""
+
+BLOCKED = "blocked"
+"""zone 未排入批次：串行受阻（target_not_newer）或依赖未就绪（dependency_blocked）。"""
+
+TARGET_NOT_NEWER = "target_not_newer"
+"""zone 内至少一个副本相对目标为 older（发布会回退该副本）。"""
+
+DEPENDENCY_BLOCKED = "dependency_blocked"
+"""zone 串行可行，但至少一个前置依赖 zone 未能排入批次（依赖链受阻）。"""
+
+
+class ReleaseBatchError(ValueError):
+    """分批发布门禁输入非法：重复 zone、未知依赖、依赖环或不可比较序列。"""
+
+    def __init__(self, detail: dict):
+        super().__init__(str(detail))
+        self.detail = detail
+
+
+def evaluate_zone_release(
+    zone: str,
+    target: int,
+    replicas: List[Tuple[str, int]],
+) -> Tuple[List[Tuple[str, int, str, int, bool]], int, List[str]]:
+    """评估单个 zone 内各副本相对目标序列号的推进关系（RFC 1982）。
+
+    *replicas* 为 ``(副本名, 当前序列号)`` 列表（副本名已由路由层校验不重复）。
+    逐副本判定：
+
+    * ``newer``：严格推进，不阻塞；
+    * ``equal``：已在目标值（前向距离 0），无需推进，不阻塞；
+    * ``older``：发布会回退该副本，阻塞；
+    * ``ambiguous``（正对点，前向距离恰为 2^31）：不可比较，整个请求无法
+      评估，抛出 :class:`ReleaseBatchError`（error=serial_incomparable，
+      含 zone 名、副本名与双方序列号）。
+
+    返回 ``(items, max_forward_distance, blocking_replicas)``：``items``
+    与输入同序，每项为 ``(name, current, relation, forward_distance,
+    blocking)``；``max_forward_distance`` 为全部副本前向模距离的最大值
+    （该 zone 共同推进到目标所需跨越的最大环形距离）；``blocking_replicas``
+    为相对目标是 ``older`` 的副本名（输入顺序）。
+    """
+    items: List[Tuple[str, int, str, int, bool]] = []
+    max_distance = 0
+    blocking: List[str] = []
+    for name, current in replicas:
+        relation = compare_serial(current, target)
+        if relation == AMBIGUOUS:
+            raise ReleaseBatchError(
+                {
+                    "error": "serial_incomparable",
+                    "message": (
+                        f"zone {zone} 的副本 {name} 当前值 {current} 与目标 "
+                        f"{target} 的前向距离恰为 2^31（正对点），"
+                        "RFC 1982 规定不可比较，无法判定推进方向"
+                    ),
+                    "zone": zone,
+                    "replica": name,
+                    "current": current,
+                    "target": target,
+                    "forward_distance": HALF,
+                }
+            )
+        distance = forward_distance(current, target)
+        is_blocking = relation == OLDER
+        if is_blocking:
+            blocking.append(name)
+        items.append((name, current, relation, distance, is_blocking))
+        if distance > max_distance:
+            max_distance = distance
+    return items, max_distance, blocking
+
+
+def _find_dependency_cycle(names: List[str], deps: dict) -> Optional[List[str]]:
+    """在依赖图上确定性查找一条依赖环（沿 depends_on 边方向）。
+
+    先 Kahn 剥离全部可排批节点（依赖均已满足的节点反复移除）；剩余子图中
+    每个节点都至少依赖一个剩余节点，从字典序最小节点出发、每步取字典序
+    最小的剩余依赖行进，必回到已访问节点，从而提取一条环。环规范化为从
+    字典序最小节点开始（与请求中 zone 的顺序无关，相同图恒得相同环）。
+    无环返回 None。
+    """
+    pending = {name: set(deps[name]) for name in names}
+    remaining = set(names)
+    queue = [name for name in names if not pending[name]]
+    while queue:
+        node = queue.pop()
+        if node not in remaining:
+            continue
+        remaining.discard(node)
+        for other in names:
+            if node in pending[other]:
+                pending[other].discard(node)
+                if not pending[other]:
+                    queue.append(other)
+    if not remaining:
+        return None
+
+    node = min(remaining)
+    path: List[str] = []
+    index_of: dict = {}
+    while node not in index_of:
+        index_of[node] = len(path)
+        path.append(node)
+        node = min(d for d in deps[node] if d in remaining)
+    cycle = path[index_of[node]:]
+    min_pos = min(range(len(cycle)), key=lambda i: cycle[i])
+    return cycle[min_pos:] + cycle[:min_pos]
+
+
+def plan_release_batches(
+    zones: List[Tuple[str, int, List[Tuple[str, int]], List[str]]],
+) -> Tuple[
+    List[List[str]],
+    List[
+        Tuple[
+            str,
+            int,
+            Optional[int],
+            List[str],
+            List[str],
+            List[str],
+            List[Tuple[str, int, str, int, bool]],
+        ]
+    ],
+]:
+    """逐 zone 做 RFC 1982 推进评估，并在依赖 DAG 上确定性分批。
+
+    *zones* 与请求同序，每项为 ``(name, target, replicas, depends_on)``：
+    ``replicas`` 为 ``(副本名, 当前序列号)`` 列表；``depends_on`` 为前置
+    zone 名列表（这些 zone 必须先于本 zone 发布）。
+
+    整体校验（抛出 :class:`ReleaseBatchError`，路由层转为 422；按以下
+    顺序检查，相同输入的报错确定可复现）：
+
+    1. zone 名重复：``duplicate_zone_name``；
+    2. 依赖未在请求中出现的 zone：``unknown_dependency``；
+    3. 依赖环（含自依赖）：``dependency_cycle``，给出规范化环路径；
+    4. 任一副本与目标不可比较（正对点）：``serial_incomparable``
+       （由 :func:`evaluate_zone_release` 按 zone 输入顺序抛出）。
+
+    分批规则（Kahn 分层，确定性）：第 0 批为全部串行可行且无未排批依赖
+    的 zone；第 k 批为全部串行可行、且全部依赖都已排入更早批次的 zone；
+    批内按 zone 名升序。串行受阻（``target_not_newer``）的 zone 不参与
+    分批；依赖链上存在未排批 zone 的 zone 同样不排批，记
+    ``dependency_blocked``（``blocking_dependencies`` 给出未排批的直接
+    依赖，按 depends_on 声明顺序）。相同输入恒得相同分批。
+
+    返回 ``(batches, results)``：``batches`` 为按批次升序的 zone 名列表
+    （批内按名称升序）；``results`` 与输入同序，每项为 ``(status,
+    max_forward_distance, batch, reasons, blocking_replicas,
+    blocking_dependencies, replica_items)``，``batch`` 未排批为 None。
+    """
+    names = [name for name, _t, _r, _d in zones]
+    seen: set = set()
+    for name in names:
+        if name in seen:
+            raise ReleaseBatchError(
+                {
+                    "error": "duplicate_zone_name",
+                    "message": f"zone 名重复：{name}，每个 zone 只能出现一次",
+                    "name": name,
+                }
+            )
+        seen.add(name)
+
+    deps: dict = {}
+    for name, _t, _r, depends_on in zones:
+        for dep in depends_on:
+            if dep not in seen:
+                raise ReleaseBatchError(
+                    {
+                        "error": "unknown_dependency",
+                        "message": (
+                            f"zone {name} 依赖了未在请求中出现的 zone：{dep}"
+                        ),
+                        "zone": name,
+                        "dependency": dep,
+                    }
+                )
+        deps[name] = list(depends_on)
+
+    cycle = _find_dependency_cycle(names, deps)
+    if cycle is not None:
+        raise ReleaseBatchError(
+            {
+                "error": "dependency_cycle",
+                "message": (
+                    "依赖关系存在环：" + " -> ".join(cycle + [cycle[0]])
+                    + "，无法确定发布先后"
+                ),
+                "cycle": cycle,
+            }
+        )
+
+    # 逐 zone 串行评估（正对点在此抛 serial_incomparable）
+    evaluations = [
+        evaluate_zone_release(name, target, replicas)
+        for name, target, replicas, _d in zones
+    ]
+
+    # Kahn 分层：仅串行可行的 zone 参与分批；批内按名称升序保证确定性
+    serial_ok = {
+        name: not blocking
+        for (name, _t, _r, _d), (_i, _m, blocking) in zip(zones, evaluations)
+    }
+    scheduled: dict = {}
+    batches: List[List[str]] = []
+    remaining = {name for name in names if serial_ok[name]}
+    while True:
+        layer = sorted(
+            name
+            for name in remaining
+            if all(dep in scheduled for dep in deps[name])
+        )
+        if not layer:
+            break
+        index = len(batches)
+        for name in layer:
+            scheduled[name] = index
+        batches.append(layer)
+        remaining -= set(layer)
+
+    results = []
+    for (name, _t, _r, depends_on), (items, max_distance, blocking_replicas) in zip(
+        zones, evaluations
+    ):
+        batch = scheduled.get(name)
+        reasons: List[str] = []
+        if blocking_replicas:
+            reasons.append(TARGET_NOT_NEWER)
+        blocking_dependencies: List[str] = []
+        if batch is None:
+            blocking_dependencies = list(
+                dict.fromkeys(d for d in depends_on if d not in scheduled)
+            )
+            if blocking_dependencies:
+                reasons.append(DEPENDENCY_BLOCKED)
+        results.append(
+            (
+                READY if batch is not None else BLOCKED,
+                max_distance,
+                batch,
+                reasons,
+                blocking_replicas,
+                blocking_dependencies,
+                items,
+            )
+        )
+    return batches, results
